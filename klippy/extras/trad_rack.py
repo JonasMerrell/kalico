@@ -87,6 +87,15 @@ class TradRack:
             ) in self.tr_kinematics.get_fil_driver_rail().get_steppers():
                 mcu_endstop.add_stepper(stepper)
 
+            # watch the toolhead sensor for the tail of a run-out spool
+            # (only active while printing out the tail, see
+            # print_runout_tail)
+            self.toolhead_tail_sensor = TradRackRunoutSensor(
+                config, self.handle_tail_runout, toolhead_fil_sensor_pin
+            )
+        else:
+            self.toolhead_tail_sensor = None
+
         # set up selector sensor as a runout sensor
         pin = config.getsection(FIL_DRIVER_STEPPER_NAME).get("endstop_pin")
         self.selector_sensor = TradRackRunoutSensor(
@@ -230,6 +239,17 @@ class TradRack:
             "keep_servo_down_after_lane_load", False
         )
         self.log_bowden_lengths = config.getboolean("log_bowden_lengths", False)
+        self.print_runout_tail = config.getboolean("print_runout_tail", False)
+        if self.print_runout_tail and self.toolhead_tail_sensor is None:
+            raise config.error(
+                "print_runout_tail requires toolhead_fil_sensor_pin"
+            )
+        self.tail_purge_speed = config.getfloat(
+            "tail_purge_speed", default=4.0, above=0.0
+        )
+        self.tail_purge_length = config.getfloat(
+            "tail_purge_length", default=None, above=0.0
+        )
 
         # other variables
         self.toolhead = None
@@ -269,6 +289,7 @@ class TradRack:
         self._reset_tool_map()
 
         # runout variables
+        self.tail_lane = None  # lane whose tail is being printed out
         self.runout_lane = None
         self.runout_steps_done = 0
         self.replacement_lane = None
@@ -300,6 +321,9 @@ class TradRack:
             "_TR_LOAD_SAVED_STATE", self._load_saved_state
         )
         self.gcode.register_command("_TR_HANDLE_RUNOUT", self._handle_runout)
+        self.gcode.register_command(
+            "_TR_HANDLE_TAIL_RUNOUT", self._handle_tail_runout
+        )
         self.gcode.register_command(
             "_TR_IDLE_RESUME", self._unload_toolhead_and_resume
         )
@@ -483,7 +507,33 @@ class TradRack:
     def handle_runout(self, eventtime):
         self.gcode.run_script("_TR_HANDLE_RUNOUT")
 
+    def handle_tail_runout(self, eventtime):
+        self.gcode.run_script("_TR_HANDLE_TAIL_RUNOUT")
+
     def _handle_runout(self, gcmd):
+        # print out the filament left in the bowden tube instead of pausing,
+        # if the toolhead still has it. The spool's tail has already left the
+        # lane module's drive gear by the time it clears the selector sensor,
+        # so Trad Rack could not pull the segment back anyway.
+        if (
+            self.print_runout_tail
+            and self.active_lane is not None
+            and self._query_toolhead_sensor()
+        ):
+            self.tail_lane = self.active_lane
+            self.lanes_buffered[self.tail_lane] = False
+            self.lanes_dead[self.tail_lane] = True
+            self.toolhead_tail_sensor.set_active(True)
+            self.gcode.respond_info(
+                "Runout detected at selector on lane {} (tool {}). Printing"
+                " the filament left in the bowden tube; the print will pause"
+                " when its tail reaches the toolhead sensor.".format(
+                    self.tail_lane, self.tool_map[self.tail_lane]
+                )
+            )
+            self.printer.send_event("trad_rack:tail_started")
+            return
+
         # send pause command
         pause_resume = self.printer.lookup_object("pause_resume")
         pause_resume.send_pause_command()
@@ -506,6 +556,89 @@ class TradRack:
         # unload filament and reload from a new lane
         self.runout_steps_done = 0
         gcmd.run_script("TR_RESUME")
+
+    def _handle_tail_runout(self, gcmd):
+        if self.tail_lane is None:
+            return
+
+        # send pause command
+        pause_resume = self.printer.lookup_object("pause_resume")
+        pause_resume.send_pause_command()
+
+        # set up resume callback and run pause gcode
+        self._set_up_resume_and_pause("runout", {}, gcmd)
+
+        # note runout. Only a short stub is left, from the toolhead sensor
+        # down to the nozzle: there is nothing to cut or unload. Loading the
+        # next filament pushes the stub through the nozzle.
+        self.runout_lane = self.tail_lane
+        self._end_tail(gcmd)
+        self.gcode.respond_info(
+            "Tail of lane {} (tool {}) reached the toolhead sensor".format(
+                self.runout_lane, self.tool_map[self.runout_lane]
+            )
+        )
+
+        # reload from a new lane (skipping the unload)
+        self.runout_steps_done = 1
+        gcmd.run_script("TR_RESUME")
+
+    def _end_tail(self, gcmd):
+        # leave the print-out-the-tail state: the toolhead no longer holds a
+        # lane's filament that Trad Rack can unload
+        self._clear_tail()
+        self._set_active_lane(None, gcmd)
+        self._raise_servo()
+        self.tr_toolhead.wait_moves()
+        self.extruder_sync_manager.unsync()
+
+    def _purge_tail(self, gcmd, min_temp=0.0, exact_temp=0.0):
+        # push the rest of a run-out lane's filament out through the nozzle
+        # (it cannot be pulled back: the lane's drive gear no longer holds it)
+        lane = self.tail_lane
+        if self.toolhead_tail_sensor is not None:
+            self.toolhead_tail_sensor.set_active(False)
+        if self._query_toolhead_sensor():
+            self._wait_for_heater_temp(gcmd, min_temp, exact_temp)
+            if self.tail_purge_length is not None:
+                length = self.tail_purge_length
+            else:
+                length = (
+                    max(self.bowden_load_length, self.bowden_unload_length)
+                    + self.fil_homing_lengths["bowden load"]
+                )
+            self.gcode.respond_info(
+                "Purging the rest of lane {} through the nozzle (up to {:.0f}"
+                " mm at {:.1f} mm/s)".format(
+                    lane, length, self.tail_purge_speed
+                )
+            )
+            self._raise_servo()
+            self.tr_toolhead.wait_moves()
+            self.extruder_sync_manager.sync_extruder_to_fil_driver()
+            pos = self.tr_toolhead.get_position()
+            pos[1] += length
+            hmove = HomingMove(
+                self.printer,
+                self.toolhead_fil_endstops,
+                self.tr_toolhead,
+                gcmd,
+            )
+            try:
+                hmove.homing_move(pos, self.tail_purge_speed, triggered=False)
+            except self.printer.command_error:
+                self.extruder_sync_manager.unsync()
+                if self.toolhead_tail_sensor is not None:
+                    self.toolhead_tail_sensor.set_active(True)
+                logging.warning(
+                    "trad_rack: Tail purge homing move failed", exc_info=True
+                )
+                raise self.printer.command_error(
+                    "Failed to purge the rest of lane {}: toolhead sensor"
+                    " still triggered after {:.0f} mm".format(lane, length)
+                )
+        self._end_tail(gcmd)
+        self.gcode.respond_info("Lane {} purged".format(lane))
 
     # gcode commands
     cmd_TR_HOME_help = "Home Trad Rack's selector"
@@ -766,6 +899,7 @@ class TradRack:
         enable.motor_enable(print_time)
 
         # set current lane and active lane
+        self._clear_tail()
         self.curr_lane = lane
         self._set_active_lane(lane, gcmd)
 
@@ -791,6 +925,7 @@ class TradRack:
     )
 
     def cmd_TR_RESET_ACTIVE_LANE(self, gcmd):
+        self._clear_tail()
         self._set_active_lane(None, gcmd)
         self._raise_servo()
         self.extruder_sync_manager.unsync()
@@ -1111,6 +1246,22 @@ class TradRack:
             )["homed_axes"]
         )
 
+    def _is_paused(self):
+        pause_resume = self.printer.lookup_object("pause_resume")
+        return pause_resume.get_status(self.reactor.monotonic())["is_paused"]
+
+    def _is_printing(self):
+        print_stats = self.printer.lookup_object("print_stats", None)
+        if print_stats is None:
+            return False
+        state = print_stats.get_status(self.reactor.monotonic())["state"]
+        return state in ("printing", "paused")
+
+    def _clear_tail(self):
+        self.tail_lane = None
+        if self.toolhead_tail_sensor is not None:
+            self.toolhead_tail_sensor.set_active(False)
+
     def _query_selector_sensor(self):
         move_time = self.tr_toolhead.get_last_move_time()
         return not not self.fil_driver_endstops[0][0].query_endstop(move_time)
@@ -1347,6 +1498,25 @@ class TradRack:
 
         # disable runout detection
         self.selector_sensor.set_active(False)
+
+        # the previous lane ran out and the rest of it is still in the bowden
+        # tube: it can only leave through the nozzle
+        if self.tail_lane is not None:
+            if self._is_printing() and not self._is_paused():
+                self.gcode.respond_info(
+                    "Lane {lane} ran out and the rest of it is still in the"
+                    " bowden tube, so Trad Rack cannot unload it for this"
+                    " toolchange. Use TR_RESUME to purge it through the nozzle"
+                    " at the park position and continue the toolchange (or"
+                    " remove it by hand and use TR_RESET_ACTIVE_LANE first).".format(
+                        lane=self.tail_lane
+                    )
+                )
+                raise TradRackLoadError(
+                    "Failed to load toolhead. Rest of run-out lane %d is"
+                    " still in the bowden tube" % self.tail_lane
+                )
+            self._purge_tail(gcmd, min_temp, exact_temp)
 
         if not (selector_already_loaded and self.curr_lane == lane):
             # unload current lane (if filament is detected)
@@ -1767,6 +1937,17 @@ class TradRack:
         *,
         gcmd,
     ):
+        # a run-out lane's tail is in the bowden: purge it instead
+        if self.tail_lane is not None:
+            if self._is_printing() and not self._is_paused():
+                raise self.printer.command_error(
+                    "Lane %d ran out and the rest of it is still in the bowden"
+                    " tube. Pause the print before unloading (it is purged"
+                    " through the nozzle)" % self.tail_lane
+                )
+            self._purge_tail(gcmd, min_temp, exact_temp)
+            return
+
         selector_sensor_state = self._query_selector_sensor()
         toolhead_sensor_state = self._query_toolhead_sensor()
 
@@ -2371,6 +2552,7 @@ class TradRack:
         return {
             "curr_lane": self.curr_lane,
             "active_lane": self.active_lane,
+            "tail_lane": self.tail_lane,
             "next_lane": self.next_lane,
             "next_tool": self.next_tool,
             "tool_map": self.tool_map,
