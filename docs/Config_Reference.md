@@ -6927,6 +6927,29 @@ toolhead_unload_length:
 #   as well as during any extrusion moves within toolhead loading or
 #   unloading that would normally involve only the extruder.
 #   The default is False.
+#print_runout_tail: False
+#   When the selector sensor detects a runout, keep printing the
+#   filament left in the bowden tube instead of pausing and unloading
+#   right away. The spool's tail has already left the lane module's
+#   drive gear by the time it clears the selector sensor, so Trad Rack
+#   cannot pull that filament back. The toolhead filament sensor then
+#   acts as the runout sensor: when the tail clears it, the print
+#   pauses and a replacement lane is loaded without cutting or
+#   unloading (the new filament pushes the remaining stub through the
+#   nozzle). If a toolchange is requested before the tail reaches the
+#   toolhead sensor, the print pauses; TR_RESUME then purges the rest
+#   of the run-out filament through the nozzle and continues the
+#   toolchange. Requires toolhead_fil_sensor_pin. The default is
+#   False.
+#tail_purge_speed: 4.0
+#   Speed (in mm/s) of the extruder when purging the rest of a run-out
+#   lane's filament through the nozzle (see print_runout_tail).
+#   The default is 4.0.
+#tail_purge_length:
+#   Maximum length (in mm) to purge before giving up if the toolhead
+#   sensor is still triggered. The default is the larger of the
+#   calibrated bowden load and unload lengths plus
+#   bowden_load_homing_dist.
 #user_wait_time: 15
 #   Time (in seconds) to wait for the user to take an action
 #   before continuing automatically. If set to -1, Trad Rack will wait
